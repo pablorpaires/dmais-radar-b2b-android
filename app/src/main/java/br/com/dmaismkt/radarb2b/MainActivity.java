@@ -8,27 +8,28 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
+import android.net.http.SslError;
 import android.os.Bundle;
-import android.view.View;
 import android.webkit.CookieManager;
 import android.webkit.GeolocationPermissions;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
+import android.webkit.RenderProcessGoneDetail;
 import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
-import android.net.http.SslError;
 import android.widget.Toast;
 
 import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends Activity {
-    private static final String START_URL = "https://dmaismkt.com.br/radar-b2b/?radar_app=android";
+    private static final String BASE_URL = "https://dmaismkt.com.br/radar-b2b/";
     private static final String TRUSTED_HOST = "dmaismkt.com.br";
     private static final int REQ_WEB_PERMISSIONS = 1401;
     private static final int REQ_GEOLOCATION = 1402;
@@ -45,14 +46,39 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         getWindow().setStatusBarColor(Color.rgb(8, 11, 16));
         getWindow().setNavigationBarColor(Color.rgb(8, 11, 16));
+        createWebView();
+
+        if (savedInstanceState == null) {
+            loadFreshStart();
+        } else if (webView.restoreState(savedInstanceState) == null) {
+            loadFreshStart();
+        }
+    }
+
+    private String startUrl() {
+        return Uri.parse(BASE_URL).buildUpon()
+                .appendQueryParameter("radar_app", "android")
+                .appendQueryParameter("app_v", "1.0.3")
+                .appendQueryParameter("_ts", String.valueOf(System.currentTimeMillis()))
+                .build().toString();
+    }
+
+    private void loadFreshStart() {
+        webView.loadUrl(startUrl());
+    }
+
+    private void createWebView() {
+        if (webView != null) {
+            try {
+                webView.stopLoading();
+                webView.destroy();
+            } catch (Exception ignored) {}
+        }
 
         webView = new WebView(this);
         webView.setBackgroundColor(Color.rgb(8, 11, 16));
         setContentView(webView);
-
         configureWebView();
-        if (savedInstanceState == null) webView.loadUrl(START_URL);
-        else webView.restoreState(savedInstanceState);
     }
 
     private void configureWebView() {
@@ -66,19 +92,25 @@ public class MainActivity extends Activity {
         s.setAllowContentAccess(true);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         s.setSupportMultipleWindows(false);
-        s.setUserAgentString(s.getUserAgentString() + " DMaisRadarAndroid/1.0.2");
+        s.setJavaScriptCanOpenWindowsAutomatically(false);
+        s.setCacheMode(WebSettings.LOAD_DEFAULT);
+        s.setLoadsImagesAutomatically(true);
+        s.setUserAgentString(s.getUserAgentString() + " DMaisRadarAndroid/1.0.3");
 
-        if (android.os.Build.VERSION.SDK_INT >= 26) WebView.startSafeBrowsing(this, null);
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            WebView.startSafeBrowsing(this, null);
+        }
         WebView.setWebContentsDebuggingEnabled(false);
 
         CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);
         cm.setAcceptThirdPartyCookies(webView, true);
+        cm.flush();
 
         webView.addJavascriptInterface(new NativeBridge(), "DMaisRadarNative");
         webView.setWebViewClient(new RadarWebViewClient());
         webView.setWebChromeClient(new RadarChromeClient());
-        webView.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        webView.setOverScrollMode(WebView.OVER_SCROLL_NEVER);
     }
 
     private boolean isTrusted(Uri uri) {
@@ -90,9 +122,7 @@ public class MainActivity extends Activity {
     private void openExternal(String rawUrl) {
         if (rawUrl == null || rawUrl.trim().isEmpty()) return;
         try {
-            Uri uri = Uri.parse(rawUrl);
-            Intent i = new Intent(Intent.ACTION_VIEW, uri);
-            startActivity(i);
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(rawUrl)));
         } catch (Exception e) {
             Toast.makeText(this, "Não foi possível abrir este link.", Toast.LENGTH_SHORT).show();
         }
@@ -103,7 +133,11 @@ public class MainActivity extends Activity {
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
             Uri uri = request.getUrl();
             String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase();
-            if ((scheme.equals("https") || scheme.equals("http")) && isTrusted(uri)) return false;
+
+            if ((scheme.equals("https") || scheme.equals("http")) && isTrusted(uri)) {
+                return false;
+            }
+
             openExternal(uri.toString());
             return true;
         }
@@ -111,14 +145,15 @@ public class MainActivity extends Activity {
         @Override
         public void onPageFinished(WebView view, String url) {
             super.onPageFinished(view, url);
-            Uri uri = Uri.parse(url);
-            if (!isTrusted(uri)) return;
-            String js = "(function(){" +
-                    "if(window.__dmaisNativeHooks)return;window.__dmaisNativeHooks=1;" +
-                    "var oldOpen=window.open;window.open=function(u){try{if(window.DMaisRadarNative&&u){window.DMaisRadarNative.openExternal(String(u));return null;}}catch(e){}return oldOpen?oldOpen.apply(window,arguments):null;};" +
-                    "document.addEventListener('click',function(e){var a=e.target&&e.target.closest?e.target.closest('a[target=\"_blank\"]'):null;if(a&&a.href&&window.DMaisRadarNative){e.preventDefault();window.DMaisRadarNative.openExternal(a.href);}},true);" +
-                    "})();";
-            view.evaluateJavascript(js, null);
+            CookieManager.getInstance().flush();
+        }
+
+        @Override
+        public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+            super.onReceivedError(view, request, error);
+            if (request != null && request.isForMainFrame()) {
+                Toast.makeText(MainActivity.this, "Falha ao carregar o Radar. Verifique sua internet e tente novamente.", Toast.LENGTH_LONG).show();
+            }
         }
 
         @Override
@@ -126,40 +161,73 @@ public class MainActivity extends Activity {
             handler.cancel();
             Toast.makeText(MainActivity.this, "Conexão segura não pôde ser validada.", Toast.LENGTH_LONG).show();
         }
+
+        @Override
+        public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+            runOnUiThread(() -> {
+                Toast.makeText(MainActivity.this, "O Radar foi recarregado para recuperar a aplicação.", Toast.LENGTH_SHORT).show();
+                createWebView();
+                loadFreshStart();
+            });
+            return true;
+        }
     }
 
     private class RadarChromeClient extends WebChromeClient {
         @Override
         public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback callback) {
             Uri originUri = Uri.parse(origin);
-            if (!isTrusted(originUri)) { callback.invoke(origin, false, false); return; }
+            if (!isTrusted(originUri)) {
+                callback.invoke(origin, false, false);
+                return;
+            }
+
             if (hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) || hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)) {
                 callback.invoke(origin, true, false);
                 return;
             }
+
             pendingGeoOrigin = origin;
             pendingGeoCallback = callback;
-            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION}, REQ_GEOLOCATION);
+            requestPermissions(
+                    new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION},
+                    REQ_GEOLOCATION
+            );
         }
 
         @Override
         public void onPermissionRequest(PermissionRequest request) {
             runOnUiThread(() -> {
-                if (!isTrusted(request.getOrigin())) { request.deny(); return; }
+                if (!isTrusted(request.getOrigin())) {
+                    request.deny();
+                    return;
+                }
+
                 List<String> androidPerms = new ArrayList<>();
                 List<String> grantResources = new ArrayList<>();
+
                 for (String r : request.getResources()) {
                     if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r)) {
                         grantResources.add(r);
-                        if (!hasPermission(Manifest.permission.CAMERA)) androidPerms.add(Manifest.permission.CAMERA);
+                        if (!hasPermission(Manifest.permission.CAMERA)) {
+                            androidPerms.add(Manifest.permission.CAMERA);
+                        }
                     } else if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) {
                         grantResources.add(r);
-                        if (!hasPermission(Manifest.permission.RECORD_AUDIO)) androidPerms.add(Manifest.permission.RECORD_AUDIO);
+                        if (!hasPermission(Manifest.permission.RECORD_AUDIO)) {
+                            androidPerms.add(Manifest.permission.RECORD_AUDIO);
+                        }
                     }
                 }
-                if (grantResources.isEmpty()) { request.deny(); return; }
-                if (androidPerms.isEmpty()) request.grant(grantResources.toArray(new String[0]));
-                else {
+
+                if (grantResources.isEmpty()) {
+                    request.deny();
+                    return;
+                }
+
+                if (androidPerms.isEmpty()) {
+                    request.grant(grantResources.toArray(new String[0]));
+                } else {
                     pendingWebPermission = request;
                     requestPermissions(androidPerms.toArray(new String[0]), REQ_WEB_PERMISSIONS);
                 }
@@ -168,10 +236,14 @@ public class MainActivity extends Activity {
 
         @Override
         public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> callback, FileChooserParams params) {
-            if (fileCallback != null) fileCallback.onReceiveValue(null);
+            if (fileCallback != null) {
+                fileCallback.onReceiveValue(null);
+            }
+
             fileCallback = callback;
             Intent intent = params.createIntent();
             intent.addCategory(Intent.CATEGORY_OPENABLE);
+
             try {
                 startActivityForResult(intent, REQ_FILE);
                 return true;
@@ -190,21 +262,32 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+
         if (requestCode == REQ_GEOLOCATION && pendingGeoCallback != null) {
-            boolean ok = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) || hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION);
+            boolean ok = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                    || hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION);
             pendingGeoCallback.invoke(pendingGeoOrigin, ok, false);
             pendingGeoCallback = null;
             pendingGeoOrigin = null;
             return;
         }
+
         if (requestCode == REQ_WEB_PERMISSIONS && pendingWebPermission != null) {
             List<String> allowed = new ArrayList<>();
             for (String r : pendingWebPermission.getResources()) {
-                if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r) && hasPermission(Manifest.permission.CAMERA)) allowed.add(r);
-                if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r) && hasPermission(Manifest.permission.RECORD_AUDIO)) allowed.add(r);
+                if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r) && hasPermission(Manifest.permission.CAMERA)) {
+                    allowed.add(r);
+                }
+                if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r) && hasPermission(Manifest.permission.RECORD_AUDIO)) {
+                    allowed.add(r);
+                }
             }
-            if (allowed.isEmpty()) pendingWebPermission.deny();
-            else pendingWebPermission.grant(allowed.toArray(new String[0]));
+
+            if (allowed.isEmpty()) {
+                pendingWebPermission.deny();
+            } else {
+                pendingWebPermission.grant(allowed.toArray(new String[0]));
+            }
             pendingWebPermission = null;
         }
     }
@@ -212,34 +295,55 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+
         if (requestCode != REQ_FILE || fileCallback == null) return;
+
         Uri[] result = null;
         if (resultCode == RESULT_OK && data != null) {
             ClipData clip = data.getClipData();
             if (clip != null) {
                 result = new Uri[clip.getItemCount()];
-                for (int i = 0; i < clip.getItemCount(); i++) result[i] = clip.getItemAt(i).getUri();
-            } else if (data.getData() != null) result = new Uri[]{data.getData()};
+                for (int i = 0; i < clip.getItemCount(); i++) {
+                    result[i] = clip.getItemAt(i).getUri();
+                }
+            } else if (data.getData() != null) {
+                result = new Uri[]{data.getData()};
+            }
         }
+
         fileCallback.onReceiveValue(result);
         fileCallback = null;
     }
 
     @Override
     public void onBackPressed() {
-        if (webView != null && webView.canGoBack()) webView.goBack();
-        else super.onBackPressed();
+        if (webView != null && webView.canGoBack()) {
+            webView.goBack();
+        } else {
+            super.onBackPressed();
+        }
     }
 
     @Override
     protected void onSaveInstanceState(Bundle outState) {
-        if (webView != null) webView.saveState(outState);
+        if (webView != null) {
+            webView.saveState(outState);
+        }
         super.onSaveInstanceState(outState);
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        if (webView != null) webView.onResume();
+    }
+
+    @Override
     protected void onPause() {
-        if (webView != null) { webView.onPause(); CookieManager.getInstance().flush(); }
+        if (webView != null) {
+            webView.onPause();
+            CookieManager.getInstance().flush();
+        }
         super.onPause();
     }
 
@@ -250,7 +354,8 @@ public class MainActivity extends Activity {
                 Intent send = new Intent(Intent.ACTION_SEND);
                 send.setType("text/plain");
                 send.putExtra(Intent.EXTRA_SUBJECT, title == null ? "D'Mais Radar B2B" : title);
-                String body = (text == null ? "" : text) + (url == null || url.isEmpty() ? "" : "\n\n" + url);
+                String body = (text == null ? "" : text)
+                        + (url == null || url.isEmpty() ? "" : "\n\n" + url);
                 send.putExtra(Intent.EXTRA_TEXT, body.trim());
                 startActivity(Intent.createChooser(send, "Compartilhar diagnóstico"));
             });
@@ -262,6 +367,8 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public String appVersion() { return "1.0.2"; }
+        public String appVersion() {
+            return "1.0.3";
+        }
     }
 }
