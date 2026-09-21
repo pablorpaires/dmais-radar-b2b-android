@@ -25,8 +25,26 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
+import com.google.android.gms.codescanner.GmsBarcodeScanner;
+import com.google.android.gms.codescanner.GmsBarcodeScannerOptions;
+import com.google.android.gms.codescanner.GmsBarcodeScanning;
+import com.google.mlkit.vision.barcode.common.Barcode;
+
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
     private static final String BASE_URL = "https://dmaismkt.com.br/radar-b2b/";
@@ -58,7 +76,7 @@ public class MainActivity extends Activity {
     private String startUrl() {
         return Uri.parse(BASE_URL).buildUpon()
                 .appendQueryParameter("radar_app", "android")
-                .appendQueryParameter("app_v", "1.0.3")
+                .appendQueryParameter("app_v", "1.0.4")
                 .appendQueryParameter("_ts", String.valueOf(System.currentTimeMillis()))
                 .build().toString();
     }
@@ -95,7 +113,7 @@ public class MainActivity extends Activity {
         s.setJavaScriptCanOpenWindowsAutomatically(false);
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
         s.setLoadsImagesAutomatically(true);
-        s.setUserAgentString(s.getUserAgentString() + " DMaisRadarAndroid/1.0.3");
+        s.setUserAgentString(s.getUserAgentString() + " DMaisRadarAndroid/1.0.4");
 
         if (android.os.Build.VERSION.SDK_INT >= 26) {
             WebView.startSafeBrowsing(this, null);
@@ -347,6 +365,211 @@ public class MainActivity extends Activity {
         super.onPause();
     }
 
+    private void sendQrToWeb(String requestId, String value) {
+        if (webView == null) return;
+        String js = "window.DMaisRadarNativeQrResult&&window.DMaisRadarNativeQrResult("
+                + JSONObject.quote(requestId == null ? "" : requestId) + ","
+                + JSONObject.quote(value == null ? "" : value) + ");";
+        webView.evaluateJavascript(js, null);
+    }
+
+    private void sendResolvedUrlToWeb(String requestId, String value) {
+        if (webView == null) return;
+        String js = "window.DMaisRadarNativeUrlResolved&&window.DMaisRadarNativeUrlResolved("
+                + JSONObject.quote(requestId == null ? "" : requestId) + ","
+                + JSONObject.quote(value == null ? "" : value) + ");";
+        webView.evaluateJavascript(js, null);
+    }
+
+    private static boolean isAllowedGoogleHost(String host) {
+        if (host == null) return false;
+        host = host.toLowerCase();
+        if (host.startsWith("www.")) host = host.substring(4);
+        return host.equals("share.google")
+                || host.equals("search.app")
+                || host.equals("maps.app.goo.gl")
+                || host.equals("goo.gl")
+                || host.equals("g.page")
+                || host.endsWith(".g.page")
+                || host.equals("google.com")
+                || host.matches("google\\.[a-z.]+")
+                || host.matches("(maps|search)\\.google\\.[a-z.]+")
+                || host.endsWith(".google.com");
+    }
+
+    private static String normalizeGoogleUrl(String raw) {
+        if (raw == null) return "";
+        String value = raw.trim()
+                .replace("\u200B", "")
+                .replace("\u200C", "")
+                .replace("\u200D", "")
+                .replace("\uFEFF", "");
+        if (value.startsWith("www.") || value.startsWith("share.google/")
+                || value.startsWith("search.app/") || value.startsWith("maps.app.goo.gl/")
+                || value.startsWith("g.page/")) {
+            value = "https://" + value.replaceFirst("^www\\.", "");
+        }
+        try {
+            Uri u = Uri.parse(value);
+            if (!"http".equalsIgnoreCase(u.getScheme()) && !"https".equalsIgnoreCase(u.getScheme())) return "";
+            if (!isAllowedGoogleHost(u.getHost())) return "";
+            return value;
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static String unwrapGoogleWrapper(String url) {
+        try {
+            Uri uri = Uri.parse(url);
+            String[] keys = {"url", "u", "target", "continue", "dest", "destination"};
+            for (String key : keys) {
+                String v = uri.getQueryParameter(key);
+                if (v == null || v.trim().isEmpty()) continue;
+                String decoded = URLDecoder.decode(v, StandardCharsets.UTF_8.name());
+                String normalized = normalizeGoogleUrl(decoded);
+                if (!normalized.isEmpty()) return normalized;
+            }
+        } catch (Exception ignored) {}
+        return url;
+    }
+
+    private static String absoluteGoogleUrl(String current, String candidate) {
+        try {
+            if (candidate == null) return "";
+            candidate = candidate.trim()
+                    .replace("&amp;", "&")
+                    .replace("\\/","/")
+                    .replace("\\u002F","/")
+                    .replace("\\u002f","/")
+                    .replace("\\u003A",":")
+                    .replace("\\u003a",":")
+                    .replace("\\u003D","=")
+                    .replace("\\u003d","=")
+                    .replace("\\u0026","&")
+                    .replace("\\u003F","?")
+                    .replace("\\u003f","?");
+            URL base = new URL(current);
+            URL next = new URL(base, candidate);
+            String normalized = normalizeGoogleUrl(next.toString());
+            return normalized.isEmpty() ? "" : unwrapGoogleWrapper(normalized);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static String extractGoogleUrlFromHtml(String current, String body) {
+        if (body == null || body.isEmpty()) return "";
+
+        String[] patterns = {
+                "<meta[^>]+http-equiv=[\"']?refresh[\"']?[^>]+content=[\"'][^\"']*url=([^\"']+)[\"']",
+                "<link[^>]+rel=[\"']canonical[\"'][^>]+href=[\"']([^\"']+)[\"']",
+                "<meta[^>]+property=[\"']og:url[\"'][^>]+content=[\"']([^\"']+)[\"']",
+                "(?:window\\.)?location(?:\\.href)?\\s*=\\s*[\"']([^\"']+)[\"']"
+        };
+        for (String p : patterns) {
+            Matcher m = Pattern.compile(p, Pattern.CASE_INSENSITIVE).matcher(body);
+            if (m.find()) {
+                String next = absoluteGoogleUrl(current, m.group(1));
+                if (!next.isEmpty() && !next.equals(current)) return next;
+            }
+        }
+
+        Matcher hrefs = Pattern.compile("<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>", Pattern.CASE_INSENSITIVE).matcher(body);
+        int inspected = 0;
+        while (hrefs.find() && inspected++ < 100) {
+            String href = hrefs.group(1);
+            if (!href.matches("(?is).*(/maps/|/search\\?|placeid=|query_place_id=|ludocid=|[?&]cid=|kgmid=|/share\\.google).*")) {
+                continue;
+            }
+            String next = absoluteGoogleUrl(current, href);
+            if (!next.isEmpty() && !next.equals(current)) return next;
+        }
+
+        Matcher urls = Pattern.compile(
+                "https?(?::|\\\\u003A)(?:/|\\\\/|\\\\u002F){2}(?:www\\.|maps\\.|search\\.)?google\\.[A-Za-z.]+[^\"'<> {}\\s]+"
+                        + "|https?(?::|\\\\u003A)(?:/|\\\\/|\\\\u002F){2}(?:share\\.google|search\\.app|maps\\.app\\.goo\\.gl|g\\.page)[^\"'<> {}\\s]+",
+                Pattern.CASE_INSENSITIVE).matcher(body);
+        int found = 0;
+        while (urls.find() && found++ < 40) {
+            String next = absoluteGoogleUrl(current, urls.group());
+            if (!next.isEmpty() && !next.equals(current)) return next;
+        }
+        return "";
+    }
+
+    private static String readResponseBody(HttpURLConnection connection) {
+        try {
+            InputStream stream = connection.getResponseCode() >= 400
+                    ? connection.getErrorStream() : connection.getInputStream();
+            if (stream == null) return "";
+            BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8));
+            StringBuilder out = new StringBuilder();
+            char[] buf = new char[4096];
+            int n;
+            int max = 650000;
+            while ((n = reader.read(buf)) > 0 && out.length() < max) {
+                out.append(buf, 0, Math.min(n, max - out.length()));
+            }
+            reader.close();
+            return out.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static String resolveGoogleRedirect(String rawUrl) {
+        String current = normalizeGoogleUrl(rawUrl);
+        if (current.isEmpty()) return rawUrl == null ? "" : rawUrl;
+
+        Set<String> visited = new HashSet<>();
+        for (int i = 0; i < 12; i++) {
+            current = unwrapGoogleWrapper(current);
+            if (visited.contains(current)) break;
+            visited.add(current);
+
+            HttpURLConnection connection = null;
+            try {
+                URL url = new URL(current);
+                if (!isAllowedGoogleHost(url.getHost())) break;
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setInstanceFollowRedirects(false);
+                connection.setRequestMethod("GET");
+                connection.setConnectTimeout(10000);
+                connection.setReadTimeout(12000);
+                connection.setRequestProperty("User-Agent",
+                        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36 DMaisRadarAndroid/1.0.4");
+                connection.setRequestProperty("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+                connection.setRequestProperty("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.7,en;q=0.6");
+
+                int code = connection.getResponseCode();
+                String location = connection.getHeaderField("Location");
+                if (location != null && !location.trim().isEmpty()) {
+                    String next = absoluteGoogleUrl(current, location);
+                    if (!next.isEmpty() && !next.equals(current)) {
+                        current = next;
+                        continue;
+                    }
+                }
+
+                String body = readResponseBody(connection);
+                String next = extractGoogleUrlFromHtml(current, body);
+                if (!next.isEmpty() && !next.equals(current)) {
+                    current = next;
+                    continue;
+                }
+
+                if (code >= 200 && code < 400) break;
+                break;
+            } catch (Exception ignored) {
+                break;
+            } finally {
+                if (connection != null) connection.disconnect();
+            }
+        }
+        return current;
+    }
+
     private class NativeBridge {
         @JavascriptInterface
         public void share(String title, String text, String url) {
@@ -367,8 +590,36 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void scanQr(String requestId) {
+            runOnUiThread(() -> {
+                GmsBarcodeScannerOptions options = new GmsBarcodeScannerOptions.Builder()
+                        .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+                        .enableAutoZoom()
+                        .build();
+                GmsBarcodeScanner scanner = GmsBarcodeScanning.getClient(MainActivity.this, options);
+                scanner.startScan()
+                        .addOnSuccessListener(barcode -> sendQrToWeb(requestId, barcode.getRawValue()))
+                        .addOnCanceledListener(() -> sendQrToWeb(requestId, ""))
+                        .addOnFailureListener(e -> {
+                            Toast.makeText(MainActivity.this,
+                                    "Não foi possível abrir o leitor de QR. Tente novamente.",
+                                    Toast.LENGTH_LONG).show();
+                            sendQrToWeb(requestId, "");
+                        });
+            });
+        }
+
+        @JavascriptInterface
+        public void resolveGoogleUrl(String requestId, String rawUrl) {
+            new Thread(() -> {
+                String resolved = resolveGoogleRedirect(rawUrl);
+                runOnUiThread(() -> sendResolvedUrlToWeb(requestId, resolved));
+            }).start();
+        }
+
+        @JavascriptInterface
         public String appVersion() {
-            return "1.0.3";
+            return "1.0.4";
         }
     }
 }
